@@ -4,3 +4,5 @@ env/
 # downloads and outputs as they could be large
 downloads/
 output/
+credentials.json
+token.json
