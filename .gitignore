@@ -1,0 +1,6 @@
+# venv
+env/
+
+# downloads and outputs as they could be large
+downloads/
+output/
