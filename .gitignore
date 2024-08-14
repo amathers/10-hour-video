@@ -6,3 +6,5 @@ downloads/
 output/
 credentials.json
 token.json
+
+__pycache__/
