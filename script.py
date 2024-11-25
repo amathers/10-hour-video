@@ -16,8 +16,7 @@ def download_youtube_video(url, output_path='downloads'):
         'format': 'best',  # Download the best quality video+audio
         'outtmpl': output_path_template,  # Save the video with the title as the filename
         'postprocessors': [{  # This section is optional
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4'  # Convert the video to mp4 format (if necessary)
+            'key': 'FFmpegVideoConvertor'
         }],
     }
     
