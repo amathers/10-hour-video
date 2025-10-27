@@ -3,10 +3,10 @@ import sys
 import logging
 import argparse
 import re
+import subprocess
 from pathlib import Path
 from math import ceil
 import yt_dlp
-from moviepy import VideoFileClip, concatenate_videoclips
 
 # Configure logging
 logging.basicConfig(
@@ -151,16 +151,42 @@ def download_youtube_video(url, output_path=DEFAULT_DOWNLOADS_DIR, quality='high
         logger.error(f"Download error: {e}")
         raise
 
-def create_extended_video(video_path, output_path=DEFAULT_OUTPUT_DIR,
-                         duration_hours=DEFAULT_DURATION_HOURS, codec="libx264"):
+def get_video_duration(video_path):
     """
-    Create an extended version of a video by looping it.
+    Get video duration using ffprobe.
+
+    Args:
+        video_path (str): Path to the video file
+
+    Returns:
+        float: Duration in seconds
+    """
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        video_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Failed to get video duration: {result.stderr}")
+
+    return float(result.stdout.strip())
+
+def create_extended_video_fast(video_path, output_path=DEFAULT_OUTPUT_DIR,
+                               duration_hours=DEFAULT_DURATION_HOURS):
+    """
+    Create an extended version of a video by looping it using ffmpeg (MUCH faster).
+
+    This method uses ffmpeg's concat demuxer which is 10-100x faster than moviepy
+    because it doesn't re-encode every frame.
 
     Args:
         video_path (str): Path to the input video file
         output_path (str): Directory to save the output video
         duration_hours (float): Desired duration in hours
-        codec (str): Video codec to use (default: libx264)
 
     Returns:
         str: Path to the output video file
@@ -183,16 +209,11 @@ def create_extended_video(video_path, output_path=DEFAULT_OUTPUT_DIR,
     except Exception as e:
         raise IOError(f"Failed to create output directory: {e}")
 
-    clip = None
-    final_clip = None
-
     try:
-        # Load video clip
-        logger.info(f"Loading video: {video_path}")
-        clip = VideoFileClip(video_path)
-
-        original_duration = clip.duration
-        target_duration = duration_hours * 3600  # Convert hours to seconds
+        # Get original video duration
+        logger.info(f"Getting video duration...")
+        original_duration = get_video_duration(video_path)
+        target_duration = duration_hours * 3600
 
         logger.info(f"Original video duration: {original_duration:.2f} seconds")
         logger.info(f"Target duration: {target_duration:.2f} seconds ({duration_hours} hours)")
@@ -200,21 +221,6 @@ def create_extended_video(video_path, output_path=DEFAULT_OUTPUT_DIR,
         # Calculate number of loops needed
         num_loops = ceil(target_duration / original_duration)
         logger.info(f"Number of loops required: {num_loops}")
-
-        # Create looped video by concatenating clips
-        logger.info("Creating looped video (this may take a while)...")
-        logger.info(f"Concatenating {num_loops} copies of the clip...")
-
-        # Create a list of the same clip repeated
-        clips = [clip] * num_loops
-
-        # Concatenate all clips
-        final_clip = concatenate_videoclips(clips, method="compose")
-
-        # Trim to exact duration if needed
-        if final_clip.duration > target_duration:
-            logger.info(f"Trimming to exact duration: {target_duration} seconds")
-            final_clip = final_clip.subclipped(0, target_duration)
 
         # Generate output filename
         base_name = os.path.basename(video_path)
@@ -224,40 +230,79 @@ def create_extended_video(video_path, output_path=DEFAULT_OUTPUT_DIR,
             f"{duration_hours}h_{name_without_ext}.mp4"
         )
 
-        # Write output video
-        logger.info(f"Writing output video to: {output_file}")
-        logger.info("This will take a significant amount of time...")
+        # Use ffmpeg to loop the video efficiently
+        # This is MUCH faster because it uses stream copying instead of re-encoding
+        logger.info(f"Creating looped video using ffmpeg (this is much faster!)...")
+        logger.info(f"Output file: {output_file}")
 
-        final_clip.write_videofile(
-            output_file,
-            codec=codec,
-            audio_codec='aac'
-        )
+        # Method 1: Use concat filter with stream copy (fastest for exact loops)
+        # Create a concat file listing the input video multiple times
+        concat_file = os.path.join(output_path, 'concat_list.txt')
+        try:
+            with open(concat_file, 'w') as f:
+                for i in range(num_loops):
+                    # Use absolute path to avoid issues
+                    abs_path = os.path.abspath(video_path)
+                    f.write(f"file '{abs_path}'\n")
 
-        logger.info(f"Video processing completed successfully!")
-        logger.info(f"Output file size: {os.path.getsize(output_file) / (1024*1024*1024):.2f} GB")
+            logger.info(f"Created concat list with {num_loops} entries")
 
-        return output_file
+            # Build ffmpeg command
+            # -f concat: use concat demuxer
+            # -safe 0: allow absolute paths
+            # -i: input concat file
+            # -c copy: stream copy (no re-encoding) - this is what makes it fast!
+            # -t: trim to exact duration
+            cmd = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', concat_file,
+                '-t', str(target_duration),
+                '-c', 'copy',  # Stream copy - no re-encoding!
+                '-y',  # Overwrite output file
+                output_file
+            ]
+
+            logger.info("Running ffmpeg (this should be much faster than moviepy)...")
+
+            # Run ffmpeg with progress output
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True
+            )
+
+            # Show progress
+            for line in process.stdout:
+                if 'time=' in line:
+                    # Extract time from ffmpeg output
+                    print(f"\r{line.strip()}", end='', flush=True)
+
+            process.wait()
+            print()  # New line
+
+            if process.returncode != 0:
+                raise Exception(f"ffmpeg failed with return code {process.returncode}")
+
+            logger.info(f"Video processing completed successfully!")
+
+            if os.path.exists(output_file):
+                file_size_gb = os.path.getsize(output_file) / (1024*1024*1024)
+                logger.info(f"Output file size: {file_size_gb:.2f} GB")
+
+            return output_file
+
+        finally:
+            # Clean up concat file
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+                logger.debug("Cleaned up concat list file")
 
     except Exception as e:
         logger.error(f"Error during video processing: {e}")
         raise
-
-    finally:
-        # Clean up resources
-        if final_clip:
-            try:
-                final_clip.close()
-                logger.debug("Closed final clip")
-            except Exception as e:
-                logger.warning(f"Error closing final clip: {e}")
-
-        if clip:
-            try:
-                clip.close()
-                logger.debug("Closed original clip")
-            except Exception as e:
-                logger.warning(f"Error closing clip: {e}")
 
 def parse_arguments():
     """
@@ -267,13 +312,14 @@ def parse_arguments():
         argparse.Namespace: Parsed arguments
     """
     parser = argparse.ArgumentParser(
-        description='Download YouTube videos and create extended looped versions',
+        description='Download YouTube videos and create extended looped versions (FAST version using ffmpeg)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python script.py -u "https://youtube.com/watch?v=..."
-  python script.py -u "https://youtube.com/watch?v=..." -d 5 -q 720p
-  python script.py -u "https://youtube.com/watch?v=..." --codec libx265
+  python script_fast.py -u "https://youtube.com/watch?v=..."
+  python script_fast.py -u "https://youtube.com/watch?v=..." -d 5 -q 720p
+
+Note: This version uses ffmpeg stream copying which is 10-100x faster than re-encoding!
         """
     )
 
@@ -296,14 +342,6 @@ Examples:
         default='highest',
         choices=['highest', 'lowest', '360p', '480p', '720p', '1080p'],
         help='Video quality (default: highest)'
-    )
-
-    parser.add_argument(
-        '--codec',
-        type=str,
-        default='libx264',
-        choices=['libx264', 'libx265', 'mpeg4'],
-        help='Video codec (default: libx264)'
     )
 
     parser.add_argument(
@@ -369,14 +407,13 @@ def main():
 
         # Create extended version
         logger.info("\n" + "=" * 60)
-        logger.info("STEP 2: CREATING EXTENDED VERSION")
+        logger.info("STEP 2: CREATING EXTENDED VERSION (FAST METHOD)")
         logger.info("=" * 60)
 
-        output_video_path = create_extended_video(
+        output_video_path = create_extended_video_fast(
             downloaded_video_path,
             output_path=args.output_dir,
-            duration_hours=args.duration,
-            codec=args.codec
+            duration_hours=args.duration
         )
 
         # Cleanup if requested
