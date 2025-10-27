@@ -176,7 +176,7 @@ def get_video_duration(video_path):
     return float(result.stdout.strip())
 
 def create_extended_video_fast(video_path, output_path=DEFAULT_OUTPUT_DIR,
-                               duration_hours=DEFAULT_DURATION_HOURS):
+                               duration_hours=DEFAULT_DURATION_HOURS, exact_duration=False):
     """
     Create an extended version of a video by looping it using ffmpeg (MUCH faster).
 
@@ -186,7 +186,9 @@ def create_extended_video_fast(video_path, output_path=DEFAULT_OUTPUT_DIR,
     Args:
         video_path (str): Path to the input video file
         output_path (str): Directory to save the output video
-        duration_hours (float): Desired duration in hours
+        duration_hours (float): Minimum desired duration in hours
+        exact_duration (bool): If True, trim to exact duration. If False (default),
+                              output will be complete loops (may exceed target duration)
 
     Returns:
         str: Path to the output video file
@@ -222,12 +224,25 @@ def create_extended_video_fast(video_path, output_path=DEFAULT_OUTPUT_DIR,
         num_loops = ceil(target_duration / original_duration)
         logger.info(f"Number of loops required: {num_loops}")
 
+        # Calculate actual final duration
+        if exact_duration:
+            final_duration = target_duration
+            logger.info(f"Exact duration mode: Output will be trimmed to exactly {duration_hours} hours")
+        else:
+            final_duration = num_loops * original_duration
+            final_duration_hours = final_duration / 3600
+            logger.info(f"Complete loops mode: Output will be {num_loops} complete loops")
+            logger.info(f"Final duration: {final_duration:.2f} seconds ({final_duration_hours:.2f} hours)")
+
         # Generate output filename
         base_name = os.path.basename(video_path)
         name_without_ext = os.path.splitext(base_name)[0]
+
+        # Use actual duration in filename
+        final_hours = final_duration / 3600
         output_file = os.path.join(
             output_path,
-            f"{duration_hours}h_{name_without_ext}.mp4"
+            f"{final_hours:.2f}h_{name_without_ext}.mp4"
         )
 
         # Use ffmpeg to loop the video efficiently
@@ -252,17 +267,23 @@ def create_extended_video_fast(video_path, output_path=DEFAULT_OUTPUT_DIR,
             # -safe 0: allow absolute paths
             # -i: input concat file
             # -c copy: stream copy (no re-encoding) - this is what makes it fast!
-            # -t: trim to exact duration
+            # -t: trim to exact duration (only if exact_duration is True)
             cmd = [
                 'ffmpeg',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', concat_file,
-                '-t', str(target_duration),
+            ]
+
+            # Only add -t flag if exact duration is requested
+            if exact_duration:
+                cmd.extend(['-t', str(target_duration)])
+
+            cmd.extend([
                 '-c', 'copy',  # Stream copy - no re-encoding!
                 '-y',  # Overwrite output file
                 output_file
-            ]
+            ])
 
             logger.info("Running ffmpeg (this should be much faster than moviepy)...")
 
@@ -318,8 +339,13 @@ def parse_arguments():
 Examples:
   python script_fast.py -u "https://youtube.com/watch?v=..."
   python script_fast.py -u "https://youtube.com/watch?v=..." -d 5 -q 720p
+  python script_fast.py -u "https://youtube.com/watch?v=..." -d 10 --exact-duration
 
-Note: This version uses ffmpeg stream copying which is 10-100x faster than re-encoding!
+Note:
+  - By default, output uses complete loops (may exceed target duration)
+    Example: 1h 1min video looped for 10h target = 10h 10min output (10 complete loops)
+  - Use --exact-duration to trim to exact target duration
+  - Uses ffmpeg stream copying which is 10-100x faster than re-encoding!
         """
     )
 
@@ -370,6 +396,12 @@ Note: This version uses ffmpeg stream copying which is 10-100x faster than re-en
         help='Enable verbose logging'
     )
 
+    parser.add_argument(
+        '--exact-duration',
+        action='store_true',
+        help='Trim output to exact duration (default: use complete loops which may exceed target duration)'
+    )
+
     return parser.parse_args()
 
 def main():
@@ -413,7 +445,8 @@ def main():
         output_video_path = create_extended_video_fast(
             downloaded_video_path,
             output_path=args.output_dir,
-            duration_hours=args.duration
+            duration_hours=args.duration,
+            exact_duration=args.exact_duration
         )
 
         # Cleanup if requested
@@ -426,7 +459,10 @@ def main():
         logger.info("SUCCESS!")
         logger.info("=" * 60)
         logger.info(f"Extended video saved to: {output_video_path}")
-        logger.info(f"Duration: {args.duration} hours")
+        if args.exact_duration:
+            logger.info(f"Duration: Exactly {args.duration} hours (trimmed)")
+        else:
+            logger.info(f"Duration: {args.duration}+ hours (complete loops, may exceed target)")
 
     except KeyboardInterrupt:
         logger.warning("\n\nProcess interrupted by user")
